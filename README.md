@@ -10,6 +10,7 @@ This project is an autonomous robot that tracks the chess matches you play on **
 * **Fully Autonomous Execution:** Supported by Playwright's background interactions, it doesn't seize your physical mouse; it sends invisible pointer events. It can continue playing efficiently even if the browser tab remains in the background (as long as it isn't fully minimized).
 * **Smart Sync & Watchdog Recovery:** Even if you start the bot in the middle of an on-going game or experience slight network drops/animations bugs, the bot scans the entire board layout in split-seconds and resumes flawlessly from where it left off, courtesy of its Auto-Recovery (Watchdog) mechanism.
 * **0 Configuration, 1-Click Setup:** As soon as you launch it, the launcher checks for missing Python libraries and fetches the latest Stockfish engine from its official repository, compiling the local environment entirely on its own.
+* **🚀 Full Rush Mode (NEW):** When enabled, the bot automatically detects the end of a match and clicks the "Play Again" or "New Game" button instantly. This allows for continuous practice loops without manual intervention. It works independently of your interface language.
 
 ### Installation Steps
 1. Download this repository to your computer (by clicking `Download ZIP` or using `git clone`).
