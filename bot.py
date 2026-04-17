@@ -17,12 +17,9 @@ class ChessBot:
         self.stockfish = Stockfish(path=sf_path, depth=15, parameters={"Threads": 2, "Hash": 64})
         self.board = chess.Board()
         self.color = None 
-        self.is_playing = False
         self.stop_event = threading.Event()
-        
-        # Watchdog variables
-        self.last_attempted_move = None
-        self.same_move_counter = 0
+        self.consecutive_sync_count = 0
+        self.last_move_time = 0
         
     def get_board_state_from_dom(self, page):
         piece_elements = page.locator(".piece").all()
@@ -74,6 +71,58 @@ class ChessBot:
                 return move
         return None
 
+    def check_clock_turn(self, page):
+        """Returns True if it's our turn (bottom clock active), False if opponent's, None if unknown."""
+        try:
+            bottom = page.locator(".clock-bottom").first
+            if bottom.is_visible(timeout=100):
+                c = bottom.get_attribute("class") or ""
+                cl = c.lower()
+                if "clock-player-turn" in cl or "clock-active" in cl:
+                    return True
+                # If bottom clock exists but isn't active, it's opponent's turn
+                top = page.locator(".clock-top").first
+                if top.is_visible(timeout=100):
+                    tc = top.get_attribute("class") or ""
+                    tcl = tc.lower()
+                    if "clock-player-turn" in tcl or "clock-active" in tcl:
+                        return False
+        except:
+            pass
+        return None
+
+    def sync_board_from_dom(self, page, dom_dict):
+        """Full board sync from DOM. Uses clock to determine whose turn it is."""
+        self.board.clear()
+        for sq, sym in dom_dict.items():
+            self.board.set_piece_at(chess.parse_square(sq), chess.Piece.from_symbol(sym))
+        
+        castling = ""
+        if dom_dict.get('e1') == 'K':
+            if dom_dict.get('h1') == 'R': castling += "K"
+            if dom_dict.get('a1') == 'R': castling += "Q"
+        if dom_dict.get('e8') == 'k':
+            if dom_dict.get('h8') == 'r': castling += "k"
+            if dom_dict.get('a8') == 'r': castling += "q"
+        if not castling: castling = "-"
+        
+        # Determine turn from clock
+        clock_turn = self.check_clock_turn(page)
+        if clock_turn is True:
+            turn = 'w' if self.color == 'w' else 'b'
+        elif clock_turn is False:
+            turn = 'b' if self.color == 'w' else 'w'
+        else:
+            turn = 'w' if self.color == 'w' else 'b'
+        
+        fen_parts = self.board.fen().split(" ")
+        fen_parts[1] = turn
+        fen_parts[2] = castling
+        fen_parts[3] = "-"
+        fen_parts[4] = "0"
+        fen_parts[5] = "1"
+        self.board.set_fen(" ".join(fen_parts))
+
     def make_move_on_screen(self, page, move_str):
         from_sq = move_str[:2]
         to_sq = move_str[2:4]
@@ -86,14 +135,13 @@ class ChessBot:
         to_f = file_map[to_sq[0]]
         to_r = int(to_sq[1]) - 1
         
-        self.log(f"Playing move: {move_str}")
         try:
             board_elem = page.locator("wc-chess-board")
             rect = board_elem.evaluate("(elem) => { let r = elem.getBoundingClientRect(); return {w: r.width, h: r.height}; }")
             
             if rect['w'] == 0:
-                self.log("ERROR: Chrome is completely minimized. Cannot click.")
-                return
+                self.log("ERROR: Chrome is completely minimized.")
+                return False
 
             sq_w = rect['w'] / 8
             sq_h = rect['h'] / 8
@@ -111,19 +159,21 @@ class ChessBot:
             to_pos = get_center_offsets(to_f, to_r)
 
             board_elem.click(position=from_pos, force=True)
-            time.sleep(0.1)
+            time.sleep(0.15)
             board_elem.click(position=to_pos, force=True)
             
             if promotion:
-                time.sleep(0.2)
+                time.sleep(0.3)
                 try:
                     page.locator(".promotion-piece.wq, .promotion-piece.bq").first.click(force=True, timeout=500)
                 except:
                     pass
                 
-            time.sleep(0.3)
+            time.sleep(0.4)
+            return True
         except Exception as e:
             self.log(f"Failed to play ({move_str}): {e}")
+            return False
 
     def loop(self, page):
         self.log("Bot loop started! Listening for moves...")
@@ -147,95 +197,123 @@ class ChessBot:
                             self.color = "w"
                             self.log("Color Detected: WHITE")
 
+                # ============ STEP 1: Sync DOM changes ============
                 dom_dict = self.get_board_state_from_dom(page)
                 curr_dict = self.board_to_dict(self.board)
                 
-                # 1. PROCESS OPPORTUNISTIC DOM CHANGES FIRST
-                # Bu bölüm Watchdog'dan önce olmalıdır. Çünkü rakip hamle yaptıysa önce tahtada karşılığını işlemeliyiz.
                 if not self.dicts_match(curr_dict, dom_dict):
-                    time.sleep(0.15)
+                    # Wait for animation to settle
+                    time.sleep(0.25)
                     dom_dict = self.get_board_state_from_dom(page)
                     
                     if not self.dicts_match(curr_dict, dom_dict):
-                        move = self.find_move_played(dom_dict)
-                        if move:
-                            self.log(f"Detected move: {move}")
-                            self.board.push(move)
-                            self.same_move_counter = 0 # Sıfırla
+                        # Try to find a single move
+                        move1 = self.find_move_played(dom_dict)
+                        if move1:
+                            self.log(f"Detected move: {move1}")
+                            self.board.push(move1)
+                            self.consecutive_sync_count = 0
+                            
+                            # Maybe TWO moves happened (our move + opponent's quick response)
+                            curr_dict = self.board_to_dict(self.board)
+                            if not self.dicts_match(curr_dict, dom_dict):
+                                time.sleep(0.15)
+                                dom_dict = self.get_board_state_from_dom(page)
+                                if not self.dicts_match(curr_dict, dom_dict):
+                                    move2 = self.find_move_played(dom_dict)
+                                    if move2:
+                                        self.log(f"Detected move: {move2}")
+                                        self.board.push(move2)
                         else:
+                            # Full sync needed
+                            self.consecutive_sync_count += 1
+                            
+                            if self.consecutive_sync_count > 3:
+                                self.log(f"Sync loop detected! Cooling down (attempt #{self.consecutive_sync_count})...")
+                                time.sleep(2)
+                                if self.consecutive_sync_count > 6:
+                                    self.log("Too many consecutive syncs. Resetting completely.")
+                                    self.consecutive_sync_count = 0
+                                    self.board.reset()
+                                    time.sleep(3)
+                                continue
+                            
                             self.log("Board desync detected! Syncing...")
-                            self.board.clear()
-                            for sq, sym in dom_dict.items():
-                                self.board.set_piece_at(chess.parse_square(sq), chess.Piece.from_symbol(sym))
-                            
-                            castling = ""
-                            if dom_dict.get('e1') == 'K':
-                                if dom_dict.get('h1') == 'R': castling += "K"
-                                if dom_dict.get('a1') == 'R': castling += "Q"
-                            if dom_dict.get('e8') == 'k':
-                                if dom_dict.get('h8') == 'r': castling += "k"
-                                if dom_dict.get('a8') == 'r': castling += "q"
-                            if not castling: castling = "-"
-                            
-                            turn = 'w' if self.color == 'w' else 'b' 
-                            fen_parts = self.board.fen().split(" ")
-                            fen_parts[1] = turn # Resetlemede başlangıç sırası bizimkisi farz edilir
-                            fen_parts[2] = castling
-                            fen_parts[3] = "-"
-                            self.board.set_fen(" ".join(fen_parts))
+                            self.sync_board_from_dom(page, dom_dict)
                             self.log("Sync Complete.")
 
-                # 2. WATCHDOG: TURN STATE VERIFICATION
-                is_our_turn_internally = (self.board.turn == chess.WHITE and self.color == "w") or \
-                                         (self.board.turn == chess.BLACK and self.color == "b")
+                # ============ STEP 2: Determine turn ============
+                clock_turn = self.check_clock_turn(page)
+                is_our_turn_internal = (self.board.turn == chess.WHITE and self.color == "w") or \
+                                       (self.board.turn == chess.BLACK and self.color == "b")
 
-                is_clock_ticking = False
-                try:
-                    clock_elem = page.locator(".clock-bottom").first
-                    if clock_elem.is_visible(timeout=100):
-                        c_class = clock_elem.get_attribute("class") or ""
-                        if "turn" in c_class.lower() or "active" in c_class.lower() or "playing" in c_class.lower():
-                            is_clock_ticking = True
-                except:
-                    pass
+                # Use clock as primary, internal as fallback
+                if clock_turn is True:
+                    is_our_turn = True
+                    if not is_our_turn_internal:
+                        self.board.turn = chess.WHITE if self.color == "w" else chess.BLACK
+                elif clock_turn is False:
+                    is_our_turn = False
+                else:
+                    is_our_turn = is_our_turn_internal
 
-                if is_clock_ticking and not is_our_turn_internally:
-                    # Rakibin hamlesini işlediğimiz halde sıra bize geçmediyse iç yapıyı düzelt
-                    self.log("Watchdog: Clock indicates it's our turn, but bot internal state is asleep. Forcing wake up!")
-                    self.board.turn = chess.WHITE if self.color == "w" else chess.BLACK
-                    is_our_turn_internally = True
-
-                # 3. STOCKFISH PLAYING
-                if is_our_turn_internally and not self.stop_event.is_set():
+                # ============ STEP 3: Play if our turn ============
+                if is_our_turn and not self.stop_event.is_set():
+                    # Throttle: prevent spamming moves faster than 1.5s apart
+                    elapsed = time.time() - self.last_move_time
+                    if elapsed < 1.5:
+                        time.sleep(turn_wait_time)
+                        continue
+                    
                     fen = self.board.fen()
                     if self.stockfish.is_fen_valid(fen): 
                         self.stockfish.set_fen_position(fen)
                         best_move = self.stockfish.get_best_move_time(800)
                         
                         if best_move:
-                            if best_move == self.last_attempted_move:
-                                self.same_move_counter += 1
-                                if self.same_move_counter >= 3:
-                                    self.log("Watchdog: Move failed 3 times! Forcing full window layer sync...")
-                                    try: page.bring_to_front() 
-                                    except: pass
-                            else:
-                                self.last_attempted_move = best_move
-                                self.same_move_counter = 0
-
                             self.log(f"[Stockfish] Best move: {best_move}")
-                            self.make_move_on_screen(page, best_move)
-                            try:
-                                self.board.push(chess.Move.from_uci(best_move))
-                            except:
-                                self.log("Warning: Internal move push failed.")
+                            success = self.make_move_on_screen(page, best_move)
+                            
+                            if success:
+                                # Push internally
+                                try:
+                                    self.board.push(chess.Move.from_uci(best_move))
+                                except:
+                                    self.log("Warning: Internal push failed.")
+                                
+                                self.last_move_time = time.time()
+                                
+                                # VERIFY: Did the move actually register on screen?
+                                time.sleep(0.5)
+                                verify_dict = self.get_board_state_from_dom(page)
+                                expected_dict = self.board_to_dict(self.board)
+                                
+                                if not self.dicts_match(expected_dict, verify_dict):
+                                    # Move click didn't register! Undo internal push.
+                                    self.log("Move verification FAILED. Click didn't register. Undoing...")
+                                    try:
+                                        self.board.pop()
+                                    except:
+                                        pass
+                                    # Small wait before retry
+                                    time.sleep(0.5)
+                                else:
+                                    self.log("Move verified ✓")
+                                    self.consecutive_sync_count = 0
                         else:
                             self.log("Stockfish found no moves.")
                             
             except Exception as e:
                 err_text = str(e)
-                if "closed" in err_text.lower() or "disconnected" in err_text.lower():
-                    self.log("Browser disconnected! Stopping...")
+                self.log(f"[Error] {err_text[:80]}")
+                # Only stop if the page itself is truly gone
+                try:
+                    if page.is_closed():
+                        self.log("Browser tab was closed! Stopping...")
+                        self.stop_event.set()
+                        break
+                except:
+                    self.log("Browser connection lost! Stopping...")
                     self.stop_event.set()
                     break
                 
@@ -246,7 +324,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Chess Bot Manager")
-        self.geometry("450x450")
+        self.geometry("450x480")
         self.resizable(False, False)
         
         self.lbl_title = ttk.Label(self, text="⚡ Automated Chess Bot ⚡", font=("Helvetica", 14, "bold"))
@@ -264,7 +342,7 @@ class App(tk.Tk):
         self.btn_stop = ttk.Button(self, text="Stop Bot", command=self.stop_bot, state=tk.DISABLED)
         self.btn_stop.pack(pady=5)
         
-        self.log_text = tk.Text(self, state=tk.DISABLED, height=14, width=50, bg="#1e1e1e", fg="white", font=("Consolas", 9))
+        self.log_text = tk.Text(self, state=tk.DISABLED, height=15, width=55, bg="#1e1e1e", fg="white", font=("Consolas", 9))
         self.log_text.pack(pady=10)
         
         self.bot = None
@@ -288,8 +366,12 @@ class App(tk.Tk):
             self.log(f"Failed to launch Chrome: {e}")
 
     def start_bot(self):
+        # Kill any leftover old bot thread
+        if self.bot:
+            self.bot.stop_event.set()
         if self.bot_thread and self.bot_thread.is_alive():
-            return
+            self.log("Waiting for old bot to stop...")
+            self.bot_thread.join(timeout=3)
             
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
@@ -325,7 +407,7 @@ class App(tk.Tk):
                 self.bot.loop(chess_page)
                 
         except Exception as e:
-            self.log(f"Connection Error: {str(e)[:50]}...")
+            self.log(f"Connection Error: {str(e)[:80]}...")
             self.log("Ensure Chrome was started using the button.")
         finally:
             self.stop_bot()
