@@ -1,0 +1,4 @@
+playwright
+stockfish
+chess
+requests

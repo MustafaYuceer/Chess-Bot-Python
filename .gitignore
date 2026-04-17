@@ -1,0 +1,7 @@
+stockfish/
+chess_profile/
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
